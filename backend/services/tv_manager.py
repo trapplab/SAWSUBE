@@ -26,6 +26,20 @@ except Exception as e:  # pragma: no cover
     HAS_LIB = False
 
 try:
+    from samsungtvws import exceptions as tvexc
+except Exception:  # pragma: no cover
+    tvexc = None  # type: ignore
+
+try:
+    from websockets.exceptions import ConnectionClosed, InvalidHandshake
+except Exception:  # pragma: no cover
+    class ConnectionClosed(Exception):  # type: ignore
+        pass
+
+    class InvalidHandshake(Exception):  # type: ignore
+        pass
+
+try:
     from wakeonlan import send_magic_packet
     HAS_WOL = True
 except Exception:
@@ -35,6 +49,68 @@ except Exception:
 
 def token_path_for(tv: TV) -> str:
     return tv.token_path or os.path.join(settings.TOKEN_DIR, f"tv_{tv.id}.token")
+
+
+# ── Error classification ─────────────────────────────────────────────────────
+# Kinds of failure when talking to a TV:
+#   offline      TV is off / unreachable / the socket dropped   → drop connection
+#   rejected     TV refused the websocket (not paired, handshake) → drop connection
+#   no_response  connected, but the art service didn't answer    → keep connection
+#                (samsungtvws counts timeouts and backs off by itself)
+#   tv_error     TV answered with an error for this request      → keep connection
+#   unexpected   anything else (bugs)                            → drop + traceback
+OFFLINE, REJECTED, NO_RESPONSE, TV_ERROR, UNEXPECTED = (
+    "offline", "rejected", "no_response", "tv_error", "unexpected")
+
+# events the TV broadcasts to every connected client; when one arrives before our
+# own ms.channel.ready, samsungtvws raises ConnectionFailure — a harmless race.
+_BROADCAST_EVENTS = {"ms.channel.clientConnect", "ms.channel.clientDisconnect"}
+
+
+def _lib_exc(name: str) -> tuple[type, ...]:
+    cls = getattr(tvexc, name, None) if tvexc else None
+    return (cls,) if isinstance(cls, type) else ()
+
+
+def _handshake_event(e: BaseException) -> str | None:
+    if _lib_exc("ConnectionFailure") and isinstance(e, _lib_exc("ConnectionFailure")) and e.args:
+        arg = e.args[0]
+        if isinstance(arg, dict):
+            return arg.get("event")
+    return None
+
+
+def classify_error(e: BaseException) -> tuple[str, str]:
+    """Return (kind, human readable message) for an exception from samsungtvws."""
+    if isinstance(e, _lib_exc("ArtServiceUnavailableError")):
+        return NO_RESPONSE, str(e)
+    if isinstance(e, ConnectionRefusedError):
+        return OFFLINE, "TV is off or unreachable (connection refused)"
+    if isinstance(e, asyncio.TimeoutError):
+        return OFFLINE, "TV is off or unreachable (connection timed out)"
+    if isinstance(e, ConnectionClosed):
+        return OFFLINE, "connection to the TV was closed"
+    if isinstance(e, OSError):
+        return OFFLINE, f"TV is unreachable ({e.strerror or e})"
+    if isinstance(e, InvalidHandshake):
+        return REJECTED, f"websocket handshake failed ({e})"
+    if isinstance(e, _lib_exc("UnauthorizedError") + _lib_exc("ChannelTimeoutError")):
+        return REJECTED, "TV rejected the connection — pair the TV again (press Allow on the TV)"
+    if isinstance(e, _lib_exc("ConnectionFailure")):
+        event = _handshake_event(e)
+        if event:
+            return REJECTED, f"TV handshake interrupted by '{event}' event"
+        return NO_RESPONSE, str(e) or "TV art service did not become ready"
+    if isinstance(e, _lib_exc("ResponseError")):
+        return TV_ERROR, str(e) or "TV returned an error"
+    if isinstance(e, _lib_exc("TimeoutError") + (AssertionError,)):
+        # samsungtvws asserts on an empty reply, i.e. the request timed out
+        return NO_RESPONSE, "TV did not answer the request (timed out)"
+    return UNEXPECTED, f"{type(e).__name__}: {e}"
+
+
+def _is_connection_problem(e: BaseException) -> bool:
+    return classify_error(e)[0] in (OFFLINE, REJECTED, NO_RESPONSE)
 
 
 class TVConnection:
@@ -50,6 +126,7 @@ class TVConnection:
         self.remote: Optional[Any] = None
         self.last_status: dict[str, Any] = {"online": False, "artmode": None, "current": None}
         self._closed = False
+        self.status_error: Optional[str] = None  # last fetch_status failure, for log de-duplication
 
     async def _ensure_art(self) -> Any:
         if not HAS_LIB:
@@ -57,15 +134,25 @@ class TVConnection:
         if self.art is not None:
             return self.art
         async with self.lock:
-            if self.art is None:
-                self.art = SamsungTVAsyncArt(
+            attempts = 3
+            for attempt in range(1, attempts + 1):
+                if self.art is not None:
+                    break
+                art = SamsungTVAsyncArt(
                     host=self.ip, port=self.port, token_file=self.token_file, name=self.name or "SAWSUBE"
                 )
                 try:
-                    await self.art.start_listening()
-                except Exception:
-                    self.art = None
+                    await art.start_listening()
+                except Exception as e:
+                    await _close_quietly(art)
+                    event = _handshake_event(e)
+                    if event in _BROADCAST_EVENTS and attempt < attempts:
+                        log.debug("TV %s art handshake interrupted by %s, retrying (%d/%d)",
+                                  self.tv_id, event, attempt, attempts)
+                        await asyncio.sleep(0.5 * attempt)
+                        continue
                     raise
+                self.art = art
         return self.art
 
     async def _ensure_remote(self) -> Any:
@@ -81,42 +168,55 @@ class TVConnection:
                 try:
                     await self.remote.start_listening()
                 except Exception:
-                    self.remote = None
+                    remote, self.remote = self.remote, None
+                    await _close_quietly(remote)
                     raise
         return self.remote
 
+    async def drop_art(self) -> None:
+        """Forget the art connection (closing its websocket) so the next call reconnects."""
+        art, self.art = self.art, None
+        await _close_quietly(art)
+
+    async def drop_remote(self) -> None:
+        remote, self.remote = self.remote, None
+        await _close_quietly(remote)
+
     async def close(self) -> None:
         self._closed = True
-        for c in (self.art, self.remote):
-            if c is not None:
-                try:
-                    await c.close()
-                except Exception:
-                    pass
-        self.art = None
-        self.remote = None
+        await self.drop_art()
+        await self.drop_remote()
 
     async def reset_connection(self) -> None:
         """Close art/remote and clear handles — lock-safe relative to the poll loop."""
         async with self.lock:
-            for c in (self.art, self.remote):
-                if c is not None:
-                    try:
-                        await c.close()
-                    except Exception:
-                        pass
-            self.art = None
-            self.remote = None
+            await self.drop_art()
+            await self.drop_remote()
 
-    async def safe(self, fn, *a, **kw):
-        async with self.lock:
-            try:
-                return await fn(*a, **kw)
-            except Exception as e:
-                log.warning("TV %s call failed: %s", self.tv_id, e)
-                # drop connection so next call retries
-                await self.close()
-                raise
+    async def handle_error(self, op: str, e: BaseException, detail: str = "",
+                           level: int = logging.INFO, remote: bool = False) -> str:
+        """Log a failed TV call according to its kind, drop the connection when it is
+        unusable, and return a short message suitable for API responses."""
+        kind, msg = classify_error(e)
+        where = f"{op} TV {self.tv_id}" + (f" {detail}" if detail else "")
+        if kind == UNEXPECTED:
+            # level DEBUG means "already reported" — don't repeat the traceback at WARNING
+            log.log(logging.WARNING if level >= logging.INFO else logging.DEBUG,
+                    "%s failed unexpectedly: %s", where, msg, exc_info=e)
+        else:
+            log.log(level, "%s failed (%s): %s", where, kind, msg)
+        if kind in (OFFLINE, REJECTED, UNEXPECTED):
+            await (self.drop_remote() if remote else self.drop_art())
+        return msg
+
+
+async def _close_quietly(c: Any) -> None:
+    if c is None:
+        return
+    try:
+        await c.close()
+    except Exception as e:  # closing a dead socket can fail in many ways
+        log.debug("ignoring error while closing TV connection: %s", e)
 
 
 class TVManager:
@@ -193,16 +293,26 @@ class TVManager:
                 try:
                     cur = await art.get_current()
                     current = cur.get("content_id") if isinstance(cur, dict) else None
-                except Exception:
-                    pass
+                except Exception as e:
+                    if classify_error(e)[0] == UNEXPECTED:
+                        raise
+                    log.debug("fetch_status TV %s: get_current failed: %s", tv_id, e)
                 tv.last_seen = datetime.utcnow()
                 await s.commit()
+                if conn.status_error is not None:
+                    log.info("TV %s is reachable again", tv_id)
+                    conn.status_error = None
                 return {"online": True, "artmode": (artmode == "on" or artmode is True),
                         "current": current}
             except Exception as e:
-                log.warning("fetch_status tv %s failed, resetting connection: %s", tv_id, e, exc_info=True)
-                conn.art = None  # force reconnect on next call
-                return {"online": False, "artmode": None, "current": None, "error": str(e)}
+                _, msg = classify_error(e)
+                # The poll loop calls this every few seconds: only log when the
+                # reason changes, otherwise an offline TV floods the log.
+                changed = conn.status_error != msg
+                level = logging.INFO if changed else logging.DEBUG
+                msg = await conn.handle_error("fetch_status", e, level=level)
+                conn.status_error = msg
+                return {"online": False, "artmode": None, "current": None, "error": msg}
 
     # ── High-level operations ────────────────────────────────────────────────
     async def pair(self, tv: TV) -> bool:
@@ -216,10 +326,12 @@ class TVManager:
         try:
             await asyncio.wait_for(conn._ensure_art(), timeout=15.0)
         except asyncio.TimeoutError:
-            log.warning("pair: connection timed out for TV %s", tv.id)
+            log.warning("pair: TV %s did not complete the handshake within 15s "
+                        "(Allow prompt not answered?)", tv.id)
+            await conn.drop_art()
             return False
         except Exception as e:
-            log.warning("pair: connection failed for TV %s: %s", tv.id, e)
+            await conn.handle_error("pair", e, level=logging.WARNING)
             return False
 
         # Connection succeeded — check whether the library received a real token.
@@ -246,7 +358,7 @@ class TVManager:
             send_magic_packet(tv.mac)
             return True
         except Exception as e:
-            log.warning("WoL failed: %s", e)
+            log.warning("WoL to %s failed for TV %s: %s", tv.mac, tv.id, e)
             return False
 
     async def power_off(self, tv: TV) -> bool:
@@ -256,7 +368,7 @@ class TVManager:
             await remote.send_command(("KEY_POWER",))
             return True
         except Exception as e:
-            log.warning("power_off failed: %s", e)
+            await conn.handle_error("power_off", e, remote=True)
             return False
 
     async def set_artmode(self, tv: TV, on: bool) -> bool:
@@ -266,24 +378,26 @@ class TVManager:
             await art.set_artmode("on" if on else "off")
             return True
         except Exception as e:
-            log.warning("set_artmode failed: %s", e, exc_info=True)
-            conn.art = None
+            await conn.handle_error("set_artmode", e, detail=f"on={on}")
             return False
 
     async def upload_image(self, tv: TV, file_path: str, matte: str = "none",
                            file_type: str = "JPEG") -> str | None:
+        # read the file first so a local I/O error isn't mistaken for "TV offline"
+        try:
+            data = await asyncio.to_thread(Path(file_path).read_bytes)
+        except OSError as e:
+            log.warning("upload_image: cannot read %s for TV %s: %s", file_path, tv.id, e)
+            return None
         conn = await self.get(tv)
         try:
             art = await conn._ensure_art()
-            with open(file_path, "rb") as f:
-                data = f.read()
             log.debug("upload_image: uploading %s to TV %s", file_path, tv.id)
             content_id = await art.upload(data, file_type=file_type, matte=matte)
             log.info("upload_image: TV %s accepted %s → remote_id=%s", tv.id, file_path, content_id)
             return content_id
         except Exception as e:
-            log.warning("upload_image failed for TV %s path=%s: %s", tv.id, file_path, e, exc_info=True)
-            conn.art = None  # force reconnect on next call
+            await conn.handle_error("upload_image", e, detail=f"path={file_path}", level=logging.WARNING)
             return None
 
     async def select_image(self, tv: TV, remote_id: str, show: bool = True) -> bool:
@@ -291,12 +405,11 @@ class TVManager:
         try:
             art = await conn._ensure_art()
             await art.select_image(remote_id, show=show)
-            await ws_manager.broadcast({"type": "art_changed", "tv_id": tv.id, "remote_id": remote_id})
-            return True
         except Exception as e:
-            log.warning("select_image failed TV %s remote_id=%s: %s", tv.id, remote_id, e, exc_info=True)
-            conn.art = None
+            await conn.handle_error("select_image", e, detail=f"remote_id={remote_id}", level=logging.WARNING)
             return False
+        await ws_manager.broadcast({"type": "art_changed", "tv_id": tv.id, "remote_id": remote_id})
+        return True
 
     async def delete_image(self, tv: TV, remote_id: str) -> bool:
         conn = await self.get(tv)
@@ -305,8 +418,7 @@ class TVManager:
             await art.delete_list([remote_id])
             return True
         except Exception as e:
-            log.warning("delete_image failed TV %s remote_id=%s: %s", tv.id, remote_id, e, exc_info=True)
-            conn.art = None
+            await conn.handle_error("delete_image", e, detail=f"remote_id={remote_id}")
             return False
 
     async def list_images(self, tv: TV) -> list[dict]:
@@ -316,8 +428,7 @@ class TVManager:
             res = await art.available()
             return res if isinstance(res, list) else []
         except Exception as e:
-            log.warning("list_images failed TV %s: %s", tv.id, e, exc_info=True)
-            conn.art = None
+            await conn.handle_error("list_images", e)
             return []
 
     async def get_thumbnail(self, tv: TV, content_id: str) -> bytes | None:
@@ -327,8 +438,8 @@ class TVManager:
             data = await art.get_thumbnail(content_id, as_bytes=True)
             return data if isinstance(data, (bytes, bytearray)) else None
         except Exception as e:
-            log.warning("get_thumbnail failed TV %s content_id=%s: %s", tv.id, content_id, e, exc_info=True)
-            conn.art = None
+            await conn.handle_error("get_thumbnail", e, detail=f"content_id={content_id}",
+                                    level=logging.DEBUG)
             return None
 
     async def set_matte(self, tv: TV, remote_id: str, matte: str) -> bool:
@@ -338,8 +449,8 @@ class TVManager:
             await art.change_matte(remote_id, matte)
             return True
         except Exception as e:
-            log.warning("set_matte failed TV %s remote_id=%s: %s", tv.id, remote_id, e, exc_info=True)
-            conn.art = None
+            # tv_error here usually means the matte isn't valid for this image's size
+            await conn.handle_error("set_matte", e, detail=f"remote_id={remote_id} matte={matte}")
             return False
 
     async def get_settings(self, tv: TV) -> dict:
@@ -358,11 +469,15 @@ class TVManager:
                 try:
                     if hasattr(art, fn):
                         out[key] = await getattr(art, fn)()
-                except Exception:
+                except Exception as e:
+                    # connection-level failures abort the whole read (otherwise every
+                    # remaining setting waits for its own timeout)
+                    if _is_connection_problem(e):
+                        raise
+                    log.debug("get_settings TV %s: %s unsupported/failed: %s", tv.id, fn, e)
                     out[key] = None
         except Exception as e:
-            log.warning("get_settings failed TV %s: %s", tv.id, e, exc_info=True)
-            conn.art = None
+            await conn.handle_error("get_settings", e)
         return out
 
     async def apply_settings(self, tv: TV, payload: dict) -> dict:
@@ -383,7 +498,9 @@ class TVManager:
                         await getattr(art, fn)(payload[key])
                         result[key] = "ok"
                     except Exception as e:
-                        result[key] = str(e)
+                        if _is_connection_problem(e):
+                            raise
+                        result[key] = classify_error(e)[1]
             if payload.get("shuffle") is not None or payload.get("slideshow_interval") is not None:
                 try:
                     await art.set_slideshow_status(
@@ -393,9 +510,11 @@ class TVManager:
                     )
                     result["slideshow"] = "ok"
                 except Exception as e:
-                    result["slideshow"] = str(e)
+                    if _is_connection_problem(e):
+                        raise
+                    result["slideshow"] = classify_error(e)[1]
         except Exception as e:
-            result["_error"] = str(e)
+            result["_error"] = await conn.handle_error("apply_settings", e)
         return result
 
     async def list_mattes(self, tv: TV) -> list[str]:
@@ -430,8 +549,7 @@ class TVManager:
                     mattes.extend(f"{t}_{c}" for c in colors)
             return mattes
         except Exception as e:
-            log.warning("list_mattes failed TV %s: %s", tv.id, e, exc_info=True)
-            conn.art = None
+            await conn.handle_error("list_mattes", e)
             return []
 
     async def get_current(self, tv: TV) -> dict | None:
@@ -440,8 +558,7 @@ class TVManager:
             art = await conn._ensure_art()
             return await art.get_current()
         except Exception as e:
-            log.debug("get_current failed TV %s: %s", tv.id, e)
-            conn.art = None
+            await conn.handle_error("get_current", e, level=logging.DEBUG)
             return None
 
     async def device_info(self, tv: TV) -> dict:
@@ -450,7 +567,7 @@ class TVManager:
             art = await conn._ensure_art()
             return await art.get_device_info() if hasattr(art, "get_device_info") else {}
         except Exception as e:
-            log.warning("device_info failed: %s", e)
+            await conn.handle_error("device_info", e)
             return {}
 
 
