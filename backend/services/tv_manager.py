@@ -402,10 +402,33 @@ class TVManager:
         conn = await self.get(tv)
         try:
             art = await conn._ensure_art()
-            res = await art.get_matte_list()
-            if isinstance(res, list):
-                return res
-            return list(res) if res else []
+            # samsungtvws returns dicts like [{"matte_type": "modern"}, ...]
+            # (and [{"color": "apricot"}, ...] with include_colour=True).
+            # The TV expects "<type>_<color>" ids, e.g. "modern_apricot".
+            try:
+                types_raw, colors_raw = await art.get_matte_list(include_colour=True)
+            except TypeError:
+                types_raw, colors_raw = await art.get_matte_list(), []
+
+            def _names(items, key: str) -> list[str]:
+                out: list[str] = []
+                for it in items or []:
+                    v = it.get(key) if isinstance(it, dict) else it
+                    if isinstance(v, str) and v and v not in out:
+                        out.append(v)
+                return out
+
+            types = _names(types_raw, "matte_type")
+            colors = _names(colors_raw, "color")
+            if not colors:
+                return types
+            mattes: list[str] = []
+            for t in types:
+                if t == "none":
+                    mattes.append(t)
+                else:
+                    mattes.extend(f"{t}_{c}" for c in colors)
+            return mattes
         except Exception as e:
             log.warning("list_mattes failed TV %s: %s", tv.id, e, exc_info=True)
             conn.art = None
